@@ -4,19 +4,9 @@ Contains the handler function that will be called by the serverless.
 
 import os
 import base64
-import concurrent.futures
-
 import torch
-from diffusers import StableDiffusionXLPipeline, StableDiffusionXLImg2ImgPipeline, AutoencoderKL
+from diffusers import AutoPipelineForImage2Image
 from diffusers.utils import load_image
-
-from diffusers import (
-    PNDMScheduler,
-    LMSDiscreteScheduler,
-    DDIMScheduler,
-    EulerDiscreteScheduler,
-    DPMSolverMultistepScheduler,
-)
 
 import runpod
 from runpod.serverless.utils import rp_upload, rp_cleanup
@@ -28,48 +18,20 @@ torch.cuda.empty_cache()
 
 # ------------------------------- Model Handler ------------------------------ #
 
-
 class ModelHandler:
     def __init__(self):
-        self.base = None
-        self.refiner = None
-        self.load_models()
+        self.pipe = None
+        self.load_model()
 
-    def load_base(self):
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-        base_pipe = StableDiffusionXLPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0", vae=vae,
-            torch_dtype=torch.float16, variant="fp16", use_safetensors=True, add_watermarker=False
+    def load_model(self):
+        self.pipe = AutoPipelineForImage2Image.from_pretrained(
+            "stabilityai/sdxl-turbo", torch_dtype=torch.float16, variant="fp16"
         )
-        base_pipe = base_pipe.to("cuda", silence_dtype_warnings=True)
-        base_pipe.enable_xformers_memory_efficient_attention()
-        return base_pipe
-
-    def load_refiner(self):
-        vae = AutoencoderKL.from_pretrained(
-            "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-        refiner_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-xl-refiner-1.0", vae=vae,
-            torch_dtype=torch.float16, variant="fp16", use_safetensors=True, add_watermarker=False
-        )
-        refiner_pipe = refiner_pipe.to("cuda", silence_dtype_warnings=True)
-        refiner_pipe.enable_xformers_memory_efficient_attention()
-        return refiner_pipe
-
-    def load_models(self):
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_base = executor.submit(self.load_base)
-            future_refiner = executor.submit(self.load_refiner)
-
-            self.base = future_base.result()
-            self.refiner = future_refiner.result()
-
+        self.pipe = self.pipe.to("cuda")
 
 MODELS = ModelHandler()
 
 # ---------------------------------- Helper ---------------------------------- #
-
 
 def _save_and_upload_images(images, job_id):
     os.makedirs(f"/{job_id}", exist_ok=True)
@@ -90,21 +52,10 @@ def _save_and_upload_images(images, job_id):
     rp_cleanup.clean([f"/{job_id}"])
     return image_urls
 
-
-def make_scheduler(name, config):
-    return {
-        "PNDM": PNDMScheduler.from_config(config),
-        "KLMS": LMSDiscreteScheduler.from_config(config),
-        "DDIM": DDIMScheduler.from_config(config),
-        "K_EULER": EulerDiscreteScheduler.from_config(config),
-        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
-    }[name]
-
-
 @torch.inference_mode()
 def generate_image(job):
     '''
-    Generate an image from text using your Model
+    Generate an image from text using SDXL Turbo
     '''
     job_input = job["input"]
 
@@ -115,54 +66,32 @@ def generate_image(job):
         return {"error": validated_input['errors']}
     job_input = validated_input['validated_input']
 
-    starting_image = job_input['image_url']
-
     if job_input['seed'] is None:
         job_input['seed'] = int.from_bytes(os.urandom(2), "big")
 
     generator = torch.Generator("cuda").manual_seed(job_input['seed'])
 
-    MODELS.base.scheduler = make_scheduler(
-        job_input['scheduler'], MODELS.base.scheduler.config)
+    starting_image = job_input['image_url']
 
-    if starting_image:  # If image_url is provided, run only the refiner pipeline
+    if starting_image:
         init_image = load_image(starting_image).convert("RGB")
-        output = MODELS.refiner(
-            prompt=job_input['prompt'],
-            num_inference_steps=job_input['refiner_inference_steps'],
-            strength=job_input['strength'],
-            image=init_image,
-            generator=generator
-        ).images
     else:
-        # Generate latent image using pipe
-        image = MODELS.base(
-            prompt=job_input['prompt'],
-            negative_prompt=job_input['negative_prompt'],
-            height=job_input['height'],
-            width=job_input['width'],
-            num_inference_steps=job_input['num_inference_steps'],
-            guidance_scale=job_input['guidance_scale'],
-            denoising_end=job_input['high_noise_frac'],
-            output_type="latent",
-            num_images_per_prompt=job_input['num_images'],
-            generator=generator
-        ).images
+        init_image = torch.randn(
+            (3, job_input['height'], job_input['width']),
+            generator=generator,
+        )
+        init_image = init_image.to(device=MODELS.pipe.device, dtype=MODELS.pipe.dtype)
 
-        try:
-            output = MODELS.refiner(
-                prompt=job_input['prompt'],
-                num_inference_steps=job_input['refiner_inference_steps'],
-                strength=job_input['strength'],
-                image=image,
-                num_images_per_prompt=job_input['num_images'],
-                generator=generator
-            ).images
-        except RuntimeError as err:
-            return {
-                "error": f"RuntimeError: {err}, Stack Trace: {err.__traceback__}",
-                "refresh_worker": True
-            }
+    output = MODELS.pipe(
+        prompt=job_input['prompt'],
+        negative_prompt=job_input['negative_prompt'],
+        image=init_image,
+        num_inference_steps=job_input['num_inference_steps'],
+        guidance_scale=job_input['guidance_scale'],
+        strength=job_input['strength'],
+        num_images_per_prompt=job_input['num_images'],
+        generator=generator
+    ).images
 
     image_urls = _save_and_upload_images(output, job['id'])
 
@@ -176,6 +105,5 @@ def generate_image(job):
         results['refresh_worker'] = True
 
     return results
-
 
 runpod.serverless.start({"handler": generate_image})
